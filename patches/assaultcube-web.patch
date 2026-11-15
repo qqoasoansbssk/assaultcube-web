@@ -1,0 +1,715 @@
+diff --git a/source/src/autodownload.cpp b/source/src/autodownload.cpp
+index 5f1e65c..5422b5c 100644
+--- a/source/src/autodownload.cpp
++++ b/source/src/autodownload.cpp
+@@ -166,7 +166,9 @@ void setupautodownload()
+     // fetch updates from all configured servers
+     // in a background thread
+     // during startup
++#ifndef __EMSCRIPTEN__ // browsers cannot reach package servers directly (no raw sockets)
+     pingallpckthread = SDL_CreateThread(pingallpckservers, "PingAllPackageServers", NULL);
++#endif
+ }
+ 
+ void pollautodownloadresponse() // thread-safe feedback from the autodownload-updater thread
+diff --git a/source/src/client.cpp b/source/src/client.cpp
+index 248d2b7..a2b914a 100644
+--- a/source/src/client.cpp
++++ b/source/src/client.cpp
+@@ -768,4 +768,4 @@ COMMANDF(timestring, "", ()
+ 
+ COMMANDF(millis, "", () { intret(totalmillis); });
+ 
+-COMMANDN(setclipboardtext, SDL_SetClipboardText, "s");
++COMMANDF(setclipboardtext, "s", (const char *text) { SDL_SetClipboardText(text); });
+diff --git a/source/src/main.cpp b/source/src/main.cpp
+index e3d4288..4629b3a 100644
+--- a/source/src/main.cpp
++++ b/source/src/main.cpp
+@@ -2,6 +2,20 @@
+ 
+ #include "cube.h"
+ 
++// reads RGB pixels; WebGL only supports RGBA readback
++static void web_readrgb(int x, int y, int w, int h, uchar *dst)
++{
++#ifdef __EMSCRIPTEN__
++    uchar *rgba = new uchar[4*w*h];
++    glPixelStorei(GL_PACK_ALIGNMENT, 4);
++    glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
++    loopi(w*h) { dst[3*i] = rgba[4*i]; dst[3*i+1] = rgba[4*i+1]; dst[3*i+2] = rgba[4*i+2]; }
++    delete[] rgba;
++#else
++    glReadPixels(x, y, w, h, GL_RGB, GL_UNSIGNED_BYTE, dst);
++#endif
++}
++
+ void cleanup(char *msg)         // single program exit point;
+ {
+     if(clientlogfile) clientlogfile->fflush();
+@@ -31,8 +45,64 @@ void cleanup(char *msg)         // single program exit point;
+ 
+ VAR(resetcfg, 0, 0, 1);
+ 
++#ifdef __EMSCRIPTEN__
++// Browser pages never "quit", so settings are written periodically and when the tab is hidden,
++// then flushed to IndexedDB (see web/pre.js).
++extern "C" EMSCRIPTEN_KEEPALIVE void web_saveall()
++{
++    extern bool quietfilewrites;
++    quietfilewrites = true;
++    extern void writeinitcfg();
++    writeinitcfg();
++    writeservercfg();
++    writepcksourcecfg();
++    if(!resetcfg) writecfg();
++    savehistory();
++    writemapmodelattributes();
++    entropy_save();
++    if(clientlogfile) clientlogfile->fflush();
++    quietfilewrites = false;
++    EM_ASM({ if (Module.saveProfile) Module.saveProfile(); });
++}
++#endif
++
++#ifdef __EMSCRIPTEN__
++// lets the page (and debugging) run CubeScript: Module.ccall('web_exec', null, ['string'], ['fog 100'])
++extern "C" EMSCRIPTEN_KEEPALIVE void web_exec(const char *script) { execute(script); }
++// turns the camera like mouse motion would (used by automated performance tests)
++extern "C" EMSCRIPTEN_KEEPALIVE void web_mousemove(int dx, int dy) { mousemove(dx, dy); }
++// benchmark: renders `steps` frames while turning the camera 360 degrees and prints the time of
++// each frame (ms) to the console; returns the slowest frame time. Independent of page visibility.
++extern "C" EMSCRIPTEN_KEEPALIVE double web_benchturn(int steps)
++{
++    double worst = 0, total = 0;
++    float yaw0 = camera1->yaw;
++    vector<char> line;
++    loopi(steps)
++    {
++        camera1->yaw = yaw0 + 360.0f * i / steps;
++        computeraytable(camera1->o.x, camera1->o.y, dynfov());
++        double t0 = emscripten_get_now();
++        gl_drawframe(screenw, screenh, 1.0f, 60.0f, 16);
++        web_glflushpending();
++        double dt = emscripten_get_now() - t0;
++        total += dt; worst = max(worst, dt);
++        cvecprintf(line, "%d:%.1f ", int(camera1->yaw) % 360, dt);
++    }
++    camera1->yaw = yaw0;
++    line.add(0);
++    printf("[bench] avg %.1f ms, worst %.1f ms | %s\n", total / steps, worst, line.getbuf());
++    return worst;
++}
++#endif
++
+ void quit()                     // normal exit
+ {
++#ifdef __EMSCRIPTEN__
++    web_saveall();
++    EM_ASM({ if (Module.onGameQuit) Module.onGameQuit(); });
++    return; // the page keeps running; the shell decides what "quit" looks like
++#endif
+     if(clientlogfile) clientlogfile->fflush();
+     const char *onquit = getalias("onQuit");
+     setcontext("hook", "onQuit");
+@@ -402,11 +472,11 @@ void mapscreenshot(const char *imagepath, bool mapshot, int fileformat, float sc
+         if(src_w != dst_w || src_h != dst_h)
+         { // scale image
+             uchar *tmpsrc = new uchar[src_w * src_h * 3];
+-            glReadPixels(0, 0, src_w, src_h, GL_RGB, GL_UNSIGNED_BYTE, tmpsrc);
++            web_readrgb(0, 0, src_w, src_h, tmpsrc);
+             scaletexture(tmpsrc, src_w, src_h, 3, tmpdst, dst_w, dst_h);
+             delete[] tmpsrc;
+         }
+-        else glReadPixels(0, 0, dst_w, dst_h, GL_RGB, GL_UNSIGNED_BYTE, tmpdst);
++        else web_readrgb(0, 0, dst_w, dst_h, tmpdst);
+         int crop_w = height ? ((dst_w - img_w) / 2) * 3 : 0;
+         int crop_h = height ? (dst_h - img_h) / 2 : 0;
+         loopirev(img_h)
+@@ -488,7 +558,14 @@ bool needsautoscreenshot = false;
+ 
+ void updatescreensize()
+ {
++#ifdef __EMSCRIPTEN__
++    // the canvas' drawing buffer is what the game renders into; the SDL window size follows the
++    // canvas' on-page size, which is 0x0 while the page is hidden or not laid out yet
++    emscripten_get_canvas_element_size("#canvas", &screenw, &screenh);
++    if(screenw < 1) screenw = 1;
++#else
+     SDL_GetWindowSize(screen, &screenw, &screenh);
++#endif
+     if(screenh < 1) screenh = 1;
+     VIRTW = screenw * VIRTH / screenh;
+     glViewport(0, 0, screenw, screenh);
+@@ -710,6 +787,9 @@ VARFP(maxfps, 0, 200, 1000, if(maxfps && maxfps < 25) maxfps = 25);
+ 
+ void limitfps(int &millis, int curmillis)
+ {
++#ifdef __EMSCRIPTEN__
++    return; // browser paces frames via requestAnimationFrame
++#endif
+     if(!maxfps) return;
+     static int fpserror = 0;
+     int delay = 1000/maxfps - (millis-curmillis);
+@@ -1205,6 +1285,129 @@ void sanitychecks()
+ 
+ #define DEFAULTPROFILEPATH "profile"
+ 
++#ifdef __EMSCRIPTEN__
++// The game window always matches the browser window.
++static void web_fitwindow()
++{
++    if(!screen) return;
++    int w = EM_ASM_INT({ return window.innerWidth; }), h = EM_ASM_INT({ return window.innerHeight; });
++    w = clamp(w, SCR_MINW, SCR_MAXW); h = clamp(h, SCR_MINH, SCR_MAXH);
++    int cw = 0, ch = 0;
++    emscripten_get_canvas_element_size("#canvas", &cw, &ch);
++    if(cw == w && ch == h && screenw == w && screenh == h) return;
++    // "fullscreen" in the browser means the page fills the window; real fullscreen is the browser's own (F11)
++    if(SDL_GetWindowFlags(screen) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) SDL_SetWindowFullscreen(screen, 0);
++    fullscreen = 0;
++    scr_w = w; scr_h = h;
++    SDL_SetWindowSize(screen, w, h);
++    emscripten_set_canvas_element_size("#canvas", w, h);
++    EM_ASM({ var c = Module.canvas; c.style.width = $0 + 'px'; c.style.height = $1 + 'px'; }, w, h);
++    updatescreensize();
++    screenw = w; screenh = h;
++    if(screenh < 1) screenh = 1;
++    VIRTW = screenw * VIRTH / screenh;
++    glViewport(0, 0, screenw, screenh);
++}
++#endif
++
++#ifdef __EMSCRIPTEN__
++// reports main-loop stages that take suspiciously long (browser hitch hunting)
++#define WEBPROF(name, stmt) do { double t0_ = emscripten_get_now(); stmt; double dt_ = emscripten_get_now() - t0_; if(dt_ > 50) printf("[slow] %s took %.0f ms\n", name, dt_); } while(0)
++#else
++#define WEBPROF(name, stmt) stmt
++#endif
++
++static bool onceauthed = true;
++static void mainloopiteration()
++{
++#ifdef __EMSCRIPTEN__
++    web_fitwindow();
++    static int lastsave = 0;
++    if(totalmillis - lastsave > 30000) { lastsave = totalmillis; if(lastsave > 30000) WEBPROF("save", web_saveall()); }
++#endif
++#ifdef _DEBUG
++    static int lastflush = 0;
++#endif
++
++        static int frames = 0;
++        static float fps = 10.0f;
++        int millis = SDL_GetTicks() - clockrealbase;
++        if(clockfix) millis = int(millis*(double(clockerror)/1000000));
++        millis += clockvirtbase;
++        if(millis<totalmillis) millis = totalmillis;
++        limitfps(millis, totalmillis);
++        int elapsed = millis-totalmillis;
++        entropy_add_byte(elapsed);
++        if(multiplayer(NULL))
++        {
++            if(ispaused) curtime = 0;
++            else curtime = elapsed;
++        }
++        else
++        {
++            static int timeerr = 0;
++            int scaledtime = elapsed*gamespeed + timeerr;
++            curtime = scaledtime/100;
++            timeerr = scaledtime%100;
++            if(!watchingdemo) skipmillis = 0;
++            if(skipmillis && watchingdemo)
++            {
++                int skipmillisnow = skipmillis > 5000 ? skipmillis - 5000 : min(1000, skipmillis);
++                curtime += skipmillisnow;
++                skipmillis -= skipmillisnow;
++            }
++            if(paused) curtime = 0;
++        }
++        lastmillis += curtime;
++        totalmillis = millis;
++
++        WEBPROF("checkinput", checkinput());
++
++        if(lastmillis) WEBPROF("updateworld", updateworld(curtime, lastmillis));
++
++        if(needsautoscreenshot) showscores(true);
++
++        WEBPROF("serverslice", serverslice(0));
++
++        if(elapsed) fps = (1000.0f/elapsed+fps*10)/11; // avoid DIV-by-0
++        frames++;
++
++        WEBPROF("updateaudio", audiomgr.updateaudio());
++
++        computeraytable(camera1->o.x, camera1->o.y, dynfov());
++        if(frames>3 && !minimized)
++        {
++            WEBPROF("drawframe", gl_drawframe(screenw, screenh, fps<lowfps ? fps/lowfps : (fps>highfps ? fps/highfps : 1.0f), fps, elapsed));
++#ifdef __EMSCRIPTEN__
++            web_glflushpending();
++#endif
++            if(frames>4) WEBPROF("swap", SDL_GL_SwapWindow(screen));
++        }
++
++        if(needsautoscreenshot)
++        {
++            showscores(true);
++            // draw again after swapping buffers, to make sure menu is captured
++            // in the screenshot regardless of which frame buffer is current
++            if(!minimized)
++            {
++                gl_drawframe(screenw, screenh, fps<lowfps ? fps/lowfps : (fps>highfps ? fps/highfps : 1.0f), fps, elapsed);
++            }
++            addsleep(0, "screenshot");
++            needsautoscreenshot = false;
++        }
++#ifdef _DEBUG
++        if(millis>lastflush+60000) { fflush(stdout); lastflush = millis; }
++#endif
++        WEBPROF("autodownload", pollautodownloadresponse());
++        if(onceauthed && sk)
++        {
++            onceauthed = false;
++            afterauth();
++        }
++    }
++
++
+ int main(int argc, char **argv)
+ {
+     DEBUGCODE(sanitychecks());
+@@ -1510,92 +1713,16 @@ int main(int argc, char **argv)
+     inputgrab(grabinput = true);
+ 
+     inmainloop = true;
+-    static bool onceauthed = true;
+-#ifdef _DEBUG
+-    int lastflush = 0;
+-#endif
+     if(scl.logident[0])
+     { // "-Nxxx" sets the number of client log lines to xxx (after init)
+         extern int clientloglinesremaining;
+         clientloglinesremaining = atoi(scl.logident);  // dual-use for scl.logident
+     }
+-    for(;;)
+-    {
+-        static int frames = 0;
+-        static float fps = 10.0f;
+-        int millis = SDL_GetTicks() - clockrealbase;
+-        if(clockfix) millis = int(millis*(double(clockerror)/1000000));
+-        millis += clockvirtbase;
+-        if(millis<totalmillis) millis = totalmillis;
+-        limitfps(millis, totalmillis);
+-        int elapsed = millis-totalmillis;
+-        entropy_add_byte(elapsed);
+-        if(multiplayer(NULL))
+-        {
+-            if(ispaused) curtime = 0;
+-            else curtime = elapsed;
+-        }
+-        else
+-        {
+-            static int timeerr = 0;
+-            int scaledtime = elapsed*gamespeed + timeerr;
+-            curtime = scaledtime/100;
+-            timeerr = scaledtime%100;
+-            if(!watchingdemo) skipmillis = 0;
+-            if(skipmillis && watchingdemo)
+-            {
+-                int skipmillisnow = skipmillis > 5000 ? skipmillis - 5000 : min(1000, skipmillis);
+-                curtime += skipmillisnow;
+-                skipmillis -= skipmillisnow;
+-            }
+-            if(paused) curtime = 0;
+-        }
+-        lastmillis += curtime;
+-        totalmillis = millis;
+-
+-        checkinput();
+-
+-        if(lastmillis) updateworld(curtime, lastmillis);
+-
+-        if(needsautoscreenshot) showscores(true);
+-
+-        serverslice(0);
+-
+-        if(elapsed) fps = (1000.0f/elapsed+fps*10)/11; // avoid DIV-by-0
+-        frames++;
+-
+-        audiomgr.updateaudio();
+-
+-        computeraytable(camera1->o.x, camera1->o.y, dynfov());
+-        if(frames>3 && !minimized)
+-        {
+-            gl_drawframe(screenw, screenh, fps<lowfps ? fps/lowfps : (fps>highfps ? fps/highfps : 1.0f), fps, elapsed);
+-            if(frames>4) SDL_GL_SwapWindow(screen);
+-        }
+-
+-        if(needsautoscreenshot)
+-        {
+-            showscores(true);
+-            // draw again after swapping buffers, to make sure menu is captured
+-            // in the screenshot regardless of which frame buffer is current
+-            if(!minimized)
+-            {
+-                gl_drawframe(screenw, screenh, fps<lowfps ? fps/lowfps : (fps>highfps ? fps/highfps : 1.0f), fps, elapsed);
+-            }
+-            addsleep(0, "screenshot");
+-            needsautoscreenshot = false;
+-        }
+-#ifdef _DEBUG
+-        if(millis>lastflush+60000) { fflush(stdout); lastflush = millis; }
++#ifdef __EMSCRIPTEN__
++    emscripten_set_main_loop(mainloopiteration, 0, 1);
++#else
++    for(;;) mainloopiteration();
+ #endif
+-        pollautodownloadresponse();
+-        if(onceauthed && sk)
+-        {
+-            onceauthed = false;
+-            afterauth();
+-        }
+-    }
+-
+     quit();
+     return EXIT_SUCCESS;
+ 
+diff --git a/source/src/platform.h b/source/src/platform.h
+index 2e72fda..2faef03 100644
+--- a/source/src/platform.h
++++ b/source/src/platform.h
+@@ -24,6 +24,11 @@
+ #include <zlib.h>
+ #include <enet/enet.h>
+ 
++#ifdef __EMSCRIPTEN__
++    #include <emscripten.h>
++    #include <emscripten/html5.h>
++#endif
++
+ #ifdef WIN32
+     #define WIN32_LEAN_AND_MEAN
+     #include "windows.h"
+@@ -55,6 +60,90 @@
+ 
+     #include "GL/glext.h"
+ 
++    #ifdef __EMSCRIPTEN__
++        // Immediate-mode calls go through web/src/webcompat.cpp, which gives every
++        // vertex a uniform attribute layout as Emscripten's GL emulation requires.
++        extern "C" {
++            void web_glBegin(GLenum); void web_glEnd(void);
++            void web_glColor4ub(GLubyte, GLubyte, GLubyte, GLubyte); void web_glColor3ub(GLubyte, GLubyte, GLubyte);
++            void web_glColor4ubv(const GLubyte *); void web_glColor4f(GLfloat, GLfloat, GLfloat, GLfloat);
++            void web_glColor3f(GLfloat, GLfloat, GLfloat); void web_glColor4fv(const GLfloat *); void web_glColor3fv(const GLfloat *);
++            void web_glTexCoord2f(GLfloat, GLfloat);
++            void web_glVertex3f(GLfloat, GLfloat, GLfloat); void web_glVertex2f(GLfloat, GLfloat);
++            void web_glVertex3fv(const GLfloat *); void web_glVertex2fv(const GLfloat *);
++            void web_glVertexPointer(GLint, GLenum, GLsizei, const void *); void web_glColorPointer(GLint, GLenum, GLsizei, const void *);
++            void web_glNormalPointer(GLenum, GLsizei, const void *); void web_glTexCoordPointer(GLint, GLenum, GLsizei, const void *);
++            void web_glDrawArrays(GLenum, GLint, GLsizei);
++            void web_glDrawElements(GLenum, GLsizei, GLenum, const void *);
++            void web_glEnableClientState(GLenum); void web_glDisableClientState(GLenum);
++            void web_glPolygonMode(GLenum, GLenum);
++            void web_glflushpending(void);
++            void web_glMatrixMode(GLenum);
++            void web_glLoadIdentity(void);
++            void web_glPushMatrix(void);
++            void web_glPopMatrix(void);
++            void web_glLoadMatrixf(const GLfloat *);
++            void web_glMultMatrixf(const GLfloat *);
++            void web_glOrtho(GLdouble, GLdouble, GLdouble, GLdouble, GLdouble, GLdouble);
++            void web_glFrustum(GLdouble, GLdouble, GLdouble, GLdouble, GLdouble, GLdouble);
++            void web_glTranslatef(GLfloat, GLfloat, GLfloat);
++            void web_glRotatef(GLfloat, GLfloat, GLfloat, GLfloat);
++            void web_glScalef(GLfloat, GLfloat, GLfloat);
++            void web_glEnable(GLenum);
++            void web_glDisable(GLenum);
++            void web_glBlendFunc(GLenum, GLenum);
++            void web_glDepthMask(GLboolean);
++            void web_glDepthFunc(GLenum);
++            void web_glViewport(GLint, GLint, GLsizei, GLsizei);
++            void web_glClear(GLbitfield);
++            void *web_getprocaddress(const char *);
++        }
++        #define glVertexPointer web_glVertexPointer
++        #define glColorPointer web_glColorPointer
++        #define glNormalPointer web_glNormalPointer
++        #define glTexCoordPointer web_glTexCoordPointer
++        #define glDrawArrays web_glDrawArrays
++        #define glDrawElements web_glDrawElements
++        #define glEnableClientState web_glEnableClientState
++        #define glDisableClientState web_glDisableClientState
++        #define glPolygonMode web_glPolygonMode
++        #define glMatrixMode web_glMatrixMode
++        #define glLoadIdentity web_glLoadIdentity
++        #define glPushMatrix web_glPushMatrix
++        #define glPopMatrix web_glPopMatrix
++        #define glLoadMatrixf web_glLoadMatrixf
++        #define glMultMatrixf web_glMultMatrixf
++        #define glOrtho web_glOrtho
++        #define glFrustum web_glFrustum
++        #define glTranslatef web_glTranslatef
++        #define glRotatef web_glRotatef
++        #define glScalef web_glScalef
++        #define glEnable web_glEnable
++        #define glDisable web_glDisable
++        #define glBlendFunc web_glBlendFunc
++        #define glDepthMask web_glDepthMask
++        #define glDepthFunc web_glDepthFunc
++        #define glViewport web_glViewport
++        #define glClear web_glClear
++        #define glBegin web_glBegin
++        #define glEnd web_glEnd
++        #define glColor4ub web_glColor4ub
++        #define glColor3ub web_glColor3ub
++        #define glColor4ubv web_glColor4ubv
++        #define glColor4f web_glColor4f
++        #define glColor3f web_glColor3f
++        #define glColor4fv web_glColor4fv
++        #define glColor3fv web_glColor3fv
++        #define glColor3d(r, g, b) web_glColor3f(float(r), float(g), float(b))
++        #define glTexCoord2f web_glTexCoord2f
++        #define glTexCoord2i(u, v) web_glTexCoord2f(float(u), float(v))
++        #define glVertex3f web_glVertex3f
++        #define glVertex2f web_glVertex2f
++        #define glVertex3fv web_glVertex3fv
++        #define glVertex2fv web_glVertex2fv
++        #define glVertex2d(x, y) web_glVertex2f(float(x), float(y))
++    #endif
++
+     #ifdef __APPLE__
+         #include "OpenAL/al.h"
+         #include "OpenAL/alc.h"
+diff --git a/source/src/rendergl.cpp b/source/src/rendergl.cpp
+index d9f60a9..3f7eb28 100644
+--- a/source/src/rendergl.cpp
++++ b/source/src/rendergl.cpp
+@@ -27,6 +27,9 @@ PFNGLSTENCILFUNCSEPARATEATIPROC glStencilFuncSeparate_ = NULL;
+ 
+ void *getprocaddress(const char *name)
+ {
++#ifdef __EMSCRIPTEN__
++    return web_getprocaddress(name);
++#endif
+     return SDL_GL_GetProcAddress(name);
+ }
+ 
+@@ -70,7 +73,14 @@ void gl_checkextensions()
+         hasMT = true;
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    // web: multi-draw is implemented in web/src/webcompat.cpp by merging ranges into one draw call
++    glMultiDrawArrays_ = (PFNGLMULTIDRAWARRAYSEXTPROC)getprocaddress("glMultiDrawArraysEXT");
++    hasMDA = glMultiDrawArrays_ != NULL;
++    if(false)
++#else
+     if(hasext(exts, "GL_EXT_multi_draw_arrays"))
++#endif
+     {
+         glMultiDrawArrays_   = (PFNGLMULTIDRAWARRAYSEXTPROC)  getprocaddress("glMultiDrawArraysEXT");
+         glMultiDrawElements_ = (PFNGLMULTIDRAWELEMENTSEXTPROC)getprocaddress("glMultiDrawElementsEXT");
+@@ -139,11 +149,13 @@ void gl_init(int w, int h, int depth, int fsaa)
+     glEnable(GL_FOG);
+     glFogi(GL_FOG_MODE, GL_LINEAR);
+     glFogf(GL_FOG_DENSITY, 0.25);
++#ifndef __EMSCRIPTEN__ // not valid hint targets in WebGL
+     glHint(GL_FOG_HINT, GL_NICEST);
+ 
+ 
+     glEnable(GL_LINE_SMOOTH);
+     glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
++#endif
+ 
+     glCullFace(GL_FRONT);
+     glEnable(GL_CULL_FACE);
+@@ -1001,9 +1013,53 @@ float depthcorrect(float d)
+ // also hits map entities which is unwanted.
+ // could be replaced by a more acurate version of monster.cpp los() if needed
+ 
++#ifdef __EMSCRIPTEN__
++// WebGL cannot read the depth buffer, so the point under the crosshair is found by marching
++// along the view ray through the cube map until it enters a solid cube, floor or ceiling.
++static bool web_raycast(const vec &from, const vec &to, vec &hit)
++{
++    vec dir = to;
++    dir.sub(from);
++    float len = dir.magnitude();
++    if(len < 1e-4f) return false;
++    const float stepsize = 0.05f;
++    dir.mul(stepsize / len);
++    int steps = int(min(len, 2048.0f) / stepsize);
++    vec p = from;
++    loopi(steps)
++    {
++        p.add(dir);
++        int x = int(floorf(p.x)), y = int(floorf(p.y));
++        if(OUTBORD(x, y)) return false;
++        sqr *s = S(x, y);
++        if(SOLID(s) || p.z < s->floor || p.z > s->ceil) { hit = p; return true; }
++    }
++    return false;
++}
++#endif
++
+ void readdepth(int w, int h, vec &pos)
+ {
++#ifdef __EMSCRIPTEN__
++    vec farpoint(0, 0, 1);
++    vec4 fw;
++    invmvpmatrix.transform(farpoint, fw);
++    vec farpos = vec(fw.x, fw.y, fw.z).div(fw.w), hit;
++    if(web_raycast(camera1->o, farpos, hit))
++    {
++        cursordepth = 0.5f; // anything below 1: "the crosshair is on geometry" (editmode checks for 1)
++        pos = hit;
++    }
++    else
++    {
++        cursordepth = 1.0f;
++        pos = farpos;
++        intersectgeometry(camera1->o, pos);
++    }
++    return;
++#else
+     glReadPixels(w/2, h/2, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &cursordepth);
++#endif
+     vec screen(0, 0, depthcorrect(cursordepth)*2 - 1);
+     vec4 world;
+     invmvpmatrix.transform(screen, world);
+diff --git a/source/src/rendertext.cpp b/source/src/rendertext.cpp
+index fafe9b9..9a7525e 100644
+--- a/source/src/rendertext.cpp
++++ b/source/src/rendertext.cpp
+@@ -67,7 +67,7 @@ bool setfont(const char *name)
+     curfont = f;
+     return true;
+ }
+-COMMAND(setfont, "s");
++COMMANDF(setfont, "s", (const char *name) { setfont(name); });
+ 
+ COMMANDF(curfont, "", () { result(curfont && curfont->name ? curfont->name : ""); });
+ 
+diff --git a/source/src/serverbrowser.cpp b/source/src/serverbrowser.cpp
+index a56f09a..ec1f9d9 100644
+--- a/source/src/serverbrowser.cpp
++++ b/source/src/serverbrowser.cpp
+@@ -1319,8 +1319,33 @@ int progress_callback_retrieveservers(void *data, float progress)
+ 
+ VARP(mastertype, 0, 0, 1); // 0: TCP direct, 1: HTTP proxy
+ 
++#ifdef __EMSCRIPTEN__
++// The page cannot wait on a socket (the reply is delivered by the same thread that would be
++// waiting), so the list comes from the local server's /master endpoint (web/serve.mjs) via a
++// synchronous HTTP request. Returns a malloc'ed string (or NULL).
++EM_JS(char *, web_fetchmasterlist, (const char *name, int version, int build), {
++    try {
++        var xhr = new XMLHttpRequest();
++        xhr.open('GET', '/master?name=' + encodeURIComponent(UTF8ToString(name)) + '&version=' + version + '&build=' + build, false);
++        xhr.send();
++        if (xhr.status !== 200) return 0;
++        return stringToNewUTF8(xhr.responseText);
++    } catch (e) { console.warn('server list request failed', e); return 0; }
++});
++#endif
++
+ void retrieveservers(vector<char> &data)
+ {
++#ifdef __EMSCRIPTEN__
++    show_out_of_renderloop_progress(0, "retrieving server list...");
++    char *list = web_fetchmasterlist(player1->name, AC_VERSION, getbuildtype());
++    if(!list) { conoutf("Master server is not replying."); return; }
++    int len = strlen(list);
++    data.put(list, len);
++    data.add(0);
++    free(list);
++    return;
++#endif
+     if(mastertype)
+     {
+         httpget h;
+diff --git a/source/src/stream.cpp b/source/src/stream.cpp
+index 3a549c5..381e97b 100644
+--- a/source/src/stream.cpp
++++ b/source/src/stream.cpp
+@@ -3,6 +3,7 @@
+ ///////////////////////// file system ///////////////////////
+ 
+ #ifndef WIN32
++bool quietfilewrites = false; // set while the web build saves the profile in the background
+ #include <unistd.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+@@ -1039,7 +1040,8 @@ stream *openmemfile(const uchar *buf, int size, int *refcnt)
+ stream *openrawfile(const char *filename, const char *mode)
+ {
+ #ifndef STANDALONE
+-    if(mode && (mode[0]=='w' || mode[0]=='a')) conoutf("writing to file: %s", filename);
++    extern bool quietfilewrites;
++    if(mode && (mode[0]=='w' || mode[0]=='a') && !quietfilewrites) conoutf("writing to file: %s", filename);
+ #endif
+     if(!strncmp(filename, "zip://", 6)) return NULL;
+     filestream *file = new filestream;
+diff --git a/source/src/vertmodel.h b/source/src/vertmodel.h
+index 08d5133..657382b 100644
+--- a/source/src/vertmodel.h
++++ b/source/src/vertmodel.h
+@@ -12,7 +12,11 @@ const int dbgvlight = 0;
+ //VAR(dbgstenc, 0, 0, 2);
+ //VAR(dbgvlight, 0, 0, 1);
+ 
++#ifdef __EMSCRIPTEN__
++VARP(mdldlist, 0, 0, 0); // no display lists in WebGL
++#else
+ VARP(mdldlist, 0, 1, 1);
++#endif
+ 
+ vec modelpos;
+ float modelroll, modelyaw, modelpitch;
+@@ -1021,7 +1025,16 @@ struct vertmodel : model
+ 
+             uchar *pixels = new uchar[2*aasize*aasize];
+             glPixelStorei(GL_PACK_ALIGNMENT, 1);
++#ifdef __EMSCRIPTEN__
++            { // WebGL can only read back RGBA; keep the red channel
++                uchar *rgba = new uchar[4*aasize*aasize];
++                glReadPixels(0, 0, aasize, aasize, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
++                loopi(aasize*aasize) pixels[i] = rgba[4*i];
++                delete[] rgba;
++            }
++#else
+             glReadPixels(0, 0, aasize, aasize, GL_RED, GL_UNSIGNED_BYTE, pixels);
++#endif
+ #if 0
+             SDL_Surface *img = SDL_CreateRGBSurface(SDL_SWSURFACE, aasize, aasize, 24, 0x0000FF, 0x00FF00, 0xFF0000, 0);
+             loopi(aasize*aasize) memset((uchar *)img->pixels + 3*i, pixels[i], 3);
+@@ -1060,6 +1073,12 @@ struct vertmodel : model
+ 
+             int aasize = 1<<(dynshadowsize + aadynshadow);
+             while(aasize > screenw || aasize > screenh) aasize /= 2;
++            if(aasize < 1<<dynshadowsize)
++            { // the screen is too small to render the shadow texture (e.g. not laid out yet): go without
++                glDeleteTextures(numframes, shadows);
++                DELETEA(shadows);
++                return;
++            }
+ 
+             stream *f = filename ? opengzfile(filename, "wb") : NULL;
+             if(f)
+@@ -1203,7 +1222,11 @@ struct vertmodel : model
+             char *dir = strrchr(filename, PATHDIV);
+             if(!dir) s[0] = '\0';
+             else copystring(s, filename, dir-filename+2);
++#ifdef __EMSCRIPTEN__
++            concatstring(s, "shadows_web.dat"); // new name: older web builds cached garbage shadows.dat files
++#else
+             concatstring(s, "shadows.dat");
++#endif
+             return s;
+         }
+ 

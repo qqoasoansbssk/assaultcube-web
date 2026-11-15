@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.bat text eol=crlf
+*.patch -text
+*.data binary
+*.wasm binary

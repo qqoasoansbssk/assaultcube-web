@@ -1,0 +1,16 @@
+{
+  "name": "assaultcube-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AssaultCube 1.3 compiled to WebAssembly, playable in the browser, with a WebSocket relay for online play",
+  "type": "module",
+  "scripts": {
+    "start": "node serve.mjs 8080",
+    "setup": "bash scripts/setup.sh",
+    "build": "bash web/build.sh"
+  },
+  "dependencies": {
+    "ws": "8.18.0"
+  },
+  "engines": { "node": ">=18" }
+}

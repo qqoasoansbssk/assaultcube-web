@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AssaultCube Web</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%226%22 fill=%22%230b0d10%22/%3E%3Cpath d=%22M16 5v22M5 16h22%22 stroke=%22%23e8a33d%22 stroke-width=%223%22/%3E%3Ccircle cx=%2216%22 cy=%2216%22 r=%227%22 fill=%22none%22 stroke=%22%23e8a33d%22 stroke-width=%222%22/%3E%3C/svg%3E">
+<style>
+  :root { --bg: #0b0d10; --fg: #e6e6e6; --muted: #8a9099; --accent: #e8a33d; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
+  #canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; outline: none; background: #000; }
+  #overlay { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; background: var(--bg); z-index: 2; }
+  #overlay h1 { margin: 0; font-size: 28px; letter-spacing: .04em; }
+  #status { color: var(--muted); min-height: 1.4em; text-align: center; padding: 0 16px; }
+  #bar { width: min(420px, 80vw); height: 6px; background: #1f2329; border-radius: 3px; overflow: hidden; }
+  #bar > div { height: 100%; width: 0; background: var(--accent); transition: width .15s; }
+  #play { display: none; padding: 10px 26px; font-size: 16px; border: 0; border-radius: 6px; background: var(--accent); color: #111; cursor: pointer; }
+  #hint { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); color: var(--muted); font-size: 12px; z-index: 1; pointer-events: none; opacity: .8; }
+</style>
+</head>
+<body>
+<canvas id="canvas" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas>
+<div id="overlay">
+  <h1>AssaultCube</h1>
+  <div id="bar"><div></div></div>
+  <div id="status">Carregando…</div>
+  <button id="play">Jogar</button>
+</div>
+<div id="hint">Clique no jogo para capturar o mouse · Esc libera</div>
+<script>
+  var canvas = document.getElementById('canvas');
+  var overlay = document.getElementById('overlay');
+  var statusEl = document.getElementById('status');
+  var barEl = document.querySelector('#bar > div');
+
+  if (!window.crossOriginIsolated) {
+    statusEl.textContent = 'Esta página precisa ser servida com os cabeçalhos COOP/COEP (use web/serve.mjs).';
+  }
+
+  function fitCanvas() {
+    var dpr = 1; // keep native resolution modest; engine renders at canvas size
+    canvas.width = Math.floor(window.innerWidth * dpr);
+    canvas.height = Math.floor(window.innerHeight * dpr);
+  }
+  fitCanvas();
+
+  // keep the last log lines around for debugging (window.acLogs)
+  window.acLogs = [];
+  function acLog(t) { acLogs.push(t); if (acLogs.length > 400) acLogs.shift(); }
+  window.addEventListener('error', function (e) { acLog('[uncaught] ' + (e.error && e.error.stack || e.message)); });
+  window.addEventListener('unhandledrejection', function (e) { acLog('[rejection] ' + (e.reason && e.reason.stack || e.reason)); });
+
+  var Module = {
+    canvas: canvas,
+    print: function (t) { acLog(t); console.log(t); },
+    printErr: function (t) { acLog('[err] ' + t); console.warn(t); },
+    setStatus: function (t) {
+      if (!t) return;
+      var m = t.match(/\(([\d.]+)\/([\d.]+)\)/);
+      if (m) {
+        var pct = 100 * parseInt(m[1]) / parseInt(m[2]);
+        barEl.style.width = pct.toFixed(1) + '%';
+        statusEl.textContent = 'Baixando dados do jogo… ' + Math.round(pct) + '%';
+      } else {
+        statusEl.textContent = t;
+      }
+    },
+    monitorRunDependencies: function (left) {
+      if (left === 0) statusEl.textContent = 'Iniciando…';
+    },
+    onRuntimeInitialized: function () {
+      overlay.style.display = 'none';
+      canvas.focus();
+    },
+    onGameQuit: function () {
+      overlay.style.display = 'flex';
+      barEl.parentNode.style.display = 'none';
+      statusEl.textContent = 'Configurações salvas. Você saiu do jogo.';
+      var b = document.getElementById('play');
+      b.textContent = 'Jogar de novo';
+      b.style.display = 'inline-block';
+      b.onclick = function () { location.reload(); };
+      if (document.exitPointerLock) document.exitPointerLock();
+    },
+    onAbort: function (what) {
+      acLog('[abort] ' + what + ' | ' + new Error().stack);
+      overlay.style.display = 'flex';
+      statusEl.textContent = 'O jogo parou: ' + what;
+    }
+  };
+
+  window.addEventListener('resize', function () {
+    // let SDL know about the new window size
+    if (Module._web_resize) Module._web_resize(window.innerWidth, window.innerHeight);
+  });
+  canvas.addEventListener('mousedown', function () { canvas.focus(); });
+</script>
+<script>
+  // ?profile: samples the call stack while you play; slow frames (> 22 ms) are summarised and
+  // uploaded to the local server (web/profiles/). Press F8 to finish early.
+  (function () {
+    if (!/[?&]profile/.test(location.search) || typeof Profiler === 'undefined') return;
+    var profiler, slow = [], last = 0, done = false, t0 = performance.now();
+    function frame(now) {
+      if (last && now - last > 22) slow.push([performance.timeOrigin + last, performance.timeOrigin + now]);
+      last = now;
+      if (!done) requestAnimationFrame(frame);
+    }
+    function start() {
+      profiler = new Profiler({ sampleInterval: 5, maxBufferSize: 200000 });
+      requestAnimationFrame(frame);
+      statusEl.textContent = '';
+      console.log('[profile] recording; play normally, press F8 to finish (auto-stops after 90s)');
+      setTimeout(finish, 90000);
+    }
+    function name(t, f) { var fr = t.frames[f]; return fr.name || ('(anon ' + (fr.resourceId != null ? t.resources[fr.resourceId] : '') + ')'); }
+    async function finish() {
+      if (done || !profiler) return; done = true;
+      var t = await profiler.stop();
+      var leaf = {}, stacks = {}, n = 0;
+      t.samples.forEach(function (s) {
+        var ts = performance.timeOrigin + s.timestamp;
+        if (s.stackId == null || !slow.some(function (r) { return ts >= r[0] && ts <= r[1]; })) return;
+        n++;
+        var st = t.stacks[s.stackId], parts = [];
+        leaf[name(t, st.frameId)] = (leaf[name(t, st.frameId)] || 0) + 1;
+        for (var id = s.stackId, d = 0; id != null && d < 14; id = t.stacks[id].parentId, d++) parts.push(name(t, t.stacks[id].frameId));
+        var key = parts.join(' < ');
+        stacks[key] = (stacks[key] || 0) + 1;
+      });
+      function top(o, k) { return Object.entries(o).sort(function (a, b) { return b[1] - a[1]; }).slice(0, k); }
+      var report = { durationMs: performance.now() - t0, slowFrames: slow.length,
+        slowMs: slow.reduce(function (a, r) { return a + r[1] - r[0]; }, 0), samplesInSlowFrames: n,
+        topLeaf: top(leaf, 40), topStacks: top(stacks, 40), logs: (window.acLogs || []).filter(function (l) { return /\[slow\]/.test(l); }).slice(-300) };
+      await fetch('/profile', { method: 'POST', body: JSON.stringify(report, null, 1) });
+      console.log('[profile] uploaded', report);
+      alert('Perfil enviado (' + slow.length + ' quadros lentos). Pode avisar o Claude.');
+    }
+    window.addEventListener('keydown', function (e) { if (e.key === 'F8') finish(); });
+    var prev = Module.onRuntimeInitialized;
+    Module.onRuntimeInitialized = function () { if (prev) prev(); try { start(); } catch (e) { console.warn('profiler unavailable', e); } };
+  })();
+</script>
+<script async src="assaultcube.js"></script>
+</body>
+</html>
