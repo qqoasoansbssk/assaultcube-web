@@ -486,7 +486,7 @@ index 2e72fda..2faef03 100644
          #include "OpenAL/al.h"
          #include "OpenAL/alc.h"
 diff --git a/source/src/rendergl.cpp b/source/src/rendergl.cpp
-index d9f60a9..3f7eb28 100644
+index d9f60a9..94b9ff2 100644
 --- a/source/src/rendergl.cpp
 +++ b/source/src/rendergl.cpp
 @@ -27,6 +27,9 @@ PFNGLSTENCILFUNCSEPARATEATIPROC glStencilFuncSeparate_ = NULL;
@@ -582,6 +582,21 @@ index d9f60a9..3f7eb28 100644
      vec screen(0, 0, depthcorrect(cursordepth)*2 - 1);
      vec4 world;
      invmvpmatrix.transform(screen, world);
+@@ -1019,7 +1075,14 @@ int effective_stencilshadow = 0;
+ void gl_drawframe(int w, int h, float changelod, float curfps, int elapsed)
+ {
+     extern int mapoverride_nostencilshadows, mapoverride_nowaterreflect;
++#ifdef __EMSCRIPTEN__
++    // web: stencil shadows do not work on WebGL here (they draw dark stair-like blocks on the floor and around
++    // players). The "Good" quality preset applied on first run turns stencilshadow on, so every new profile got
++    // the bug. Always off: models fall back to the texture ("blob") shadows, which work.
++    effective_stencilshadow = 0;
++#else
+     effective_stencilshadow = mapoverride_nostencilshadows && !ignoreoverride_nostencilshadows ? 0 : stencilshadow;
++#endif
+     bool effective_waterreflect = waterreflect && !editmode && (!mapoverride_nowaterreflect || ignoreoverride_nowaterreflect);
+ 
+     dodynlights();
 diff --git a/source/src/rendertext.cpp b/source/src/rendertext.cpp
 index fafe9b9..9a7525e 100644
 --- a/source/src/rendertext.cpp
